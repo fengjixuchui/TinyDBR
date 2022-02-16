@@ -1008,10 +1008,10 @@ void TinyDBR::InstrumentModule(ModuleInfo* module)
 	}
 
 	ExtractAndProtectCodeRanges(module->module_header,
-					  module->min_address,
-					  module->max_address,
-					  &module->executable_ranges,
-					  &module->code_size);
+								module->min_address,
+								module->max_address,
+								&module->executable_ranges,
+								&module->code_size);
 
 	// allocate buffer for instrumented code
 	module->instrumented_code_size = module->code_size * CODE_SIZE_MULTIPLIER;
@@ -1094,13 +1094,23 @@ void TinyDBR::PatchPointersLocalT(char* buf, size_t size, std::unordered_map<siz
 	}
 }
 
-void TinyDBR::InstrumentMainModule(const std::string& module_name)
+void TinyDBR::InstrumentMainModule(const TargetModule& module)
 {
-	auto module_info = IsInstrumentModule(module_name.c_str());
+	auto module_info = IsInstrumentModule(module.name.c_str());
 	if (module_info)
 	{
 		module_info->main_module = true;
-		HANDLE module_handle = GetModuleHandleA(module_name.c_str());
+		void* module_handle      = nullptr;
+
+		if (!shellcode_mode)
+		{
+			module_handle = GetModuleHandleA(module.name.c_str());
+		}
+		else
+		{
+			module_handle = module.code_sections[0].code;
+		}
+		
 		OnInstrumentModuleLoaded(module_handle, module_info);
 		InstrumentModule(module_info);
 	}
@@ -1325,13 +1335,34 @@ void TinyDBR::OnProcessExit()
 	ClearCrossModuleLinks();
 }
 
+void TinyDBR::InitUnwindGenerator()
+{
+	if (!generate_unwind || shellcode_mode)
+	{
+		unwind_generator = new UnwindGenerator(*this);
+	}
+	else
+	{
+#ifdef __APPLE__
+		unwind_generator = new UnwindGeneratorMacOS(*this);
+#elif defined(_WIN64)
+		unwind_generator = new WinUnwindGenerator(*this);
+#else
+		WARN("Unwind generator not implemented for the current platform");
+		unwind_generator = new UnwindGenerator(*this);
+#endif
+	}
+	unwind_generator->Init();
+}
+
 // initializes instrumentation from command line options
-void TinyDBR::Init(const std::vector<std::string>& instrument_module_names)
+void TinyDBR::Init(const std::vector<TargetModule>& target_modules,
+				   const Options&                   options)
 {
 	// init the executor first
-	Executor::Init(instrument_module_names);
+	Executor::Init(target_modules, options);
 
-	if (instrument_module_names.empty())
+	if (target_modules.empty())
 	{
 		return;
 	}
@@ -1345,21 +1376,13 @@ void TinyDBR::Init(const std::vector<std::string>& instrument_module_names)
 
 	instrumentation_disabled = false;
 
-	//instrument_modules_on_load = GetBinaryOption("-instrument_modules_on_load", argc, argv, false);
-	//patch_return_addresses = GetBinaryOption("-patch_return_addresses", argc, argv, false);
-	//instrument_cross_module_calls = GetBinaryOption("-instrument_cross_module_calls", argc, argv, true);
-	//persist_instrumentation_data = GetBinaryOption("-persist_instrumentation_data", argc, argv, true);
+	instrument_modules_on_load    = options.instrument_modules_on_load;
+	patch_return_addresses        = options.patch_return_addresses;
+	instrument_cross_module_calls = options.instrument_cross_module_calls;
+	persist_instrumentation_data  = options.persist_instrumentation_data;
 
-	//trace_basic_blocks = GetBinaryOption("-trace_basic_blocks", argc, argv, false);
-	//trace_module_entries = GetBinaryOption("-trace_module_entries", argc, argv, false);
-
-	instrument_modules_on_load    = false;
-	patch_return_addresses        = false;
-	instrument_cross_module_calls = true;
-	persist_instrumentation_data  = true;
-
-	trace_basic_blocks   = false;
-	trace_module_entries = true;
+	trace_basic_blocks   = options.trace_basic_blocks;
+	trace_module_entries = options.trace_module_entries;
 
 #if defined(WIN32) || defined(_WIN32) || defined(__WIN32) || defined(ARM64)
 	sp_offset = 0;
@@ -1373,33 +1396,16 @@ void TinyDBR::Init(const std::vector<std::string>& instrument_module_names)
 	sp_offset = 256;
 #endif
 
-	// sp_offset = GetIntOption("-stack_offset", argc, argv, sp_offset);
-	sp_offset = 0;
+	sp_offset = options.sp_offset;
 
-	//GetOptionAll("-instrument_module", argc, argv, &module_names);
-	for (auto iter = instrument_module_names.begin(); iter != instrument_module_names.end(); iter++)
+	for (const auto& module : target_modules)
 	{
 		ModuleInfo* new_module  = new ModuleInfo();
-		new_module->module_name = *iter;
+		new_module->module_name = module.name;
 		instrumented_modules.push_back(new_module);
 	}
 
-	//char *option;
-
 	indirect_instrumentation_mode = II_AUTO;
-	//option = GetOption("-indirect_instrumentation", argc, argv);
-	//if (option) {
-	//  if (strcmp(option, "none") == 0)
-	//    indirect_instrumentation_mode = II_NONE;
-	//  else if (strcmp(option, "local") == 0)
-	//    indirect_instrumentation_mode = II_LOCAL;
-	//  else if (strcmp(option, "global") == 0)
-	//    indirect_instrumentation_mode = II_GLOBAL;
-	//  else if (strcmp(option, "auto") == 0)
-	//    indirect_instrumentation_mode = II_AUTO;
-	//  else
-	//    FATAL("Unknown indirect instrumentation mode");
-	//}
 
 	patch_module_entries = PatchModuleEntriesValue::OFF;
 	//option = GetOption("-patch_module_entries", argc, argv);
@@ -1416,8 +1422,7 @@ void TinyDBR::Init(const std::vector<std::string>& instrument_module_names)
 	//    FATAL("Unknown -patch_module_entries value");
 	//}
 
-	// generate_unwind = GetBinaryOption("-generate_unwind", argc, argv, false);
-	generate_unwind = true;
+	generate_unwind = options.generate_unwind;
 
 	// if patch_return_addresses is on, disable generate_unwind
 	// regardless of the flag
@@ -1426,22 +1431,31 @@ void TinyDBR::Init(const std::vector<std::string>& instrument_module_names)
 		generate_unwind = false;
 	}
 
-	if (!generate_unwind)
-	{
-		unwind_generator = new UnwindGenerator(*this);
-	}
-	else
-	{
-#ifdef __APPLE__
-		unwind_generator = new UnwindGeneratorMacOS(*this);
-#elif defined(_WIN64)
-		unwind_generator = new WinUnwindGenerator(*this);
-#else
-		WARN("Unwind generator not implemented for the current platform");
-		unwind_generator = new UnwindGenerator(*this);
-#endif
-	}
-	unwind_generator->Init();
+	InitUnwindGenerator();
 
-	InstrumentMainModule(instrument_module_names[0]);
+	for (const auto& mod : target_modules)
+	{
+		if (!mod.is_main)
+		{
+			continue;
+		}
+
+		InstrumentMainModule(mod);
+		break;
+	}
+}
+
+void TinyDBR::Unit()
+{
+	Executor::Unit();
+}
+
+void TinyDBR::EnableInstrumentation()
+{
+	instrumentation_disabled = false;
+}
+
+void TinyDBR::DisableInstrumentation()
+{
+	instrumentation_disabled = true;
 }

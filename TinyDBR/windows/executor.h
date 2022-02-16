@@ -1,8 +1,9 @@
 #pragma once
 
-#include "../arch/x86/reg.h"
-#include "../common.h"
-#include "../singleton.h"
+#include "arch/x86/reg.h"
+#include "common.h"
+#include "singleton.h"
+#include "api_helper.h"
 
 #include <list>
 #include <string>
@@ -10,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 #include <mutex>
+#include <memory>
 
 #include <Windows.h>
 
@@ -29,6 +31,9 @@ class Executor : public Singleton<TinyDBR>
 {
 	friend class Singleton<TinyDBR>;
 	friend class UnwindGenerator;
+	friend class ApiHelper;
+	friend class ModuleHelper;
+	friend class ShellcodeHelper;
 #if defined(_WIN64)
 	friend class WinUnwindGenerator;
 #elif __APPLE__
@@ -39,8 +44,8 @@ public:
 	Executor();
 	virtual ~Executor();
 
-	// First module in array must be the main executable module.
-	virtual void Init(const std::vector<std::string>& instrument_module_names);
+	virtual void Init(const std::vector<TargetModule>& target_modules,
+					  const Options&                   options);
 
 	virtual void Unit();
 
@@ -96,11 +101,11 @@ protected:
 	void ProtectCodeRanges(
 		std::list<AddressRange>* executable_ranges);
 
-	DWORD GetImageSize(void* base_address);
-	void  GetImageSize(
-		 void*   base_address,
-		 size_t* min_address,
-		 size_t* max_address);
+	uint32_t GetImageSize(void* base_address);
+	void     GetImageSize(
+			void*   base_address,
+			size_t* min_address,
+			size_t* max_address);
 
 	void GetExceptionHandlers(size_t module_haeder, std::unordered_set<size_t>& handlers);
 
@@ -124,11 +129,12 @@ protected:
 	void SaveRegisters(Context* context, SavedRegisters* registers);
 	void RestoreRegisters(Context* context, SavedRegisters* registers);
 
-	DWORD GetProcOffset(HMODULE module, const char* name);
+	uint32_t GetProcOffset(HMODULE module, const char* name);
 
 protected:
 	int32_t child_ptr_size           = sizeof(void*);
 	bool    child_entrypoint_reached = false;
+	bool    shellcode_mode           = false;
 
 private:
 	void* InstallVEHHandler();
@@ -159,13 +165,15 @@ private:
 						  Exception*        exception);
 
 private:
+	bool trace_debug_events = false;
+
 	void*  veh_handle             = nullptr;
 	void*  dll_notify_cookie      = nullptr;
 	size_t allocation_granularity = 0;
 	HANDLE self_handle            = NULL;
 	bool   have_thread_context    = false;
 
-	bool trace_debug_events = false;
-	std::vector<std::string> instrument_modules;
-	std::mutex exception_mutex;
+	std::vector<TargetModule>  instrument_modules;
+	std::mutex                 exception_mutex;
+	std::unique_ptr<ApiHelper> api_helper;
 };
