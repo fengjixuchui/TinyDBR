@@ -1,9 +1,7 @@
 #pragma once
 
 #include "tinydbr.h"
-
-
-
+#include <array>
 
 enum MonitorFlag : uint64_t
 {
@@ -16,21 +14,31 @@ typedef uint64_t MonitorFlags;
 
 class MemoryMonitor : public TinyDBR
 {
+
 public:
 	MemoryMonitor(MonitorFlags flags);
 	virtual ~MemoryMonitor();
 
 protected:
-	InstructionResult InstrumentInstruction(
-		ModuleInfo*  module,
-		Instruction& inst,
-		size_t       bb_address,
-		size_t       instruction_address) override;
+	// These functions will be called from generated assemble code.
 
-private:
-	bool NeedToHandle(Instruction& inst);
+	// modrm memory read
+	void OnMemoryRead(void* address, size_t size);
 
-private:
+	// modrm memory write
+	void OnMemoryWrite(void* address, size_t size, size_t value);
+
+	// [rep ...] movs ...
+	void OnStringMov(void* dst, void* src, size_t size);
+
+	// [rep ...] lods ... , scas ... , cmps ...
+	void OnStringRead(void* address, size_t size);
+
+	// [rep ...] stos ...
+	void OnStringWrite(void* address, size_t size, size_t value);
+
+protected:
 	MonitorFlags m_flags = 0;
 };
+
 

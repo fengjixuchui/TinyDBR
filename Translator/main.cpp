@@ -1,4 +1,5 @@
 #include "tinydbr.h"
+#include "arch/x86/x86_memory_monitor.h"
 
 #include <Windows.h>
 #include <filesystem>
@@ -10,7 +11,7 @@
 * before the execution of main module entry point.
 */
 
-
+std::unique_ptr<Executor> instrumenter;
 
 
 // For detours inject
@@ -46,22 +47,26 @@ void InitRewrite()
 			break;
 		}
 
-		auto tinydbr = TinyDBR::GetInstance();
+		MonitorFlags flags = IgnoreCode | IgnoreStack | IgnoreRipRelative;
+		instrumenter       = std::make_unique<X86MemoryMonitor>(flags);
+		//instrumenter = std::make_unique<TinyDBR>();
 
 		TargetModule main_module = {};
 		main_module.name         = module_name;
 		main_module.is_main      = true;
 
 		Options options          = {};
-		tinydbr->Init({ main_module }, options);
+		instrumenter->Init({ main_module }, options);
 
 	} while (false);
 }
 
 void UnitRewrite()
 {
-	auto tinydbr = TinyDBR::GetInstance();
-	tinydbr->Unit();
+	if (instrumenter)
+	{
+		instrumenter->Unit();
+	}
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule,

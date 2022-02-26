@@ -158,38 +158,43 @@ void X86Assembler::JmpAddress(ModuleInfo *module, size_t address) {
 // checks if the instruction uses RIP-relative addressing,
 // e.g. mov rax, [rip+displacement]; call [rip+displacement]
 // and, if so, returns the memory address being referenced
-bool X86Assembler::IsRipRelative(ModuleInfo *module,
-                                 Instruction& inst,
-                                 size_t instruction_address,
-                                 size_t *mem_address) {
-  bool rip_relative = false;
-  int64_t disp;
+bool X86Assembler::IsRipRelative(ModuleInfo*  module,
+								 Instruction& inst,
+								 size_t       instruction_address,
+								 size_t*      mem_address)
+{
+	bool        rip_relative = false;
+	const auto& zinst        = inst.zinst;
+	bool        is_relative = zinst.instruction.attributes & ZYDIS_ATTRIB_IS_RELATIVE;
 
-  uint32_t memops = xed_decoded_inst_number_of_memory_operands(&inst.xedd);
-
-  for (uint32_t i = 0; i < memops; i++) {
-    xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&inst.xedd, i);
-    switch (base) {
-      case XED_REG_RIP:
-      case XED_REG_EIP:
-      case XED_REG_IP:
-        rip_relative = true;
-        disp = xed_decoded_inst_get_memory_displacement(&inst.xedd, i);
-        break;
-      default:
-        break;
+	if (!is_relative)
+	{
+		return false;
+	}
+	
+    auto operand = FindExplicitMemoryOperand(inst);
+    if (!operand)
+    {
+		return false;
     }
-  }
 
-  if (!rip_relative) return false;
+    rip_relative = operand->mem.base == ZYDIS_REGISTER_EIP ||
+				   operand->mem.base == ZYDIS_REGISTER_RIP;
 
-  if (mem_address)
-  {
-	  size_t instruction_size = xed_decoded_inst_get_length(&inst.xedd);
-	  *mem_address            = (size_t)(instruction_address + instruction_size + disp);
-  }
+    if (!rip_relative)
+    {
+		return false;
+    }
 
-  return rip_relative;
+	int64_t disp = zinst.instruction.raw.disp.value;
+
+	if (mem_address)
+	{
+		size_t instruction_size = zinst.instruction.length;
+		*mem_address            = (size_t)(instruction_address + instruction_size + disp);
+	}
+
+	return rip_relative;
 }
 
 // checks if the instruction uses RSP-relative addressing,
@@ -198,35 +203,19 @@ bool X86Assembler::IsRipRelative(ModuleInfo *module,
 bool X86Assembler::IsRspRelative(Instruction& inst,
 								 size_t*      displacement)
 {
-	bool    rsp_relative = false;
-	int64_t disp;
+	bool rsp_relative = false;
+	auto operand      = FindExplicitMemoryOperand(inst);
 
-	uint32_t memops = xed_decoded_inst_number_of_memory_operands(&inst.xedd);
-
-	for (uint32_t i = 0; i < memops; i++)
+	if (operand->mem.base == ZYDIS_REGISTER_SP ||
+		operand->mem.base == ZYDIS_REGISTER_ESP ||
+		operand->mem.base == ZYDIS_REGISTER_RSP)
 	{
-		xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&inst.xedd, i);
-		switch (base)
+		rsp_relative = true;
+		if (displacement && operand->mem.disp.has_displacement)
 		{
-		case XED_REG_RSP:
-		case XED_REG_ESP:
-		case XED_REG_SP:
-			rsp_relative = true;
-			disp         = xed_decoded_inst_get_memory_displacement(&inst.xedd, i);
-			break;
-		default:
-			break;
+			*displacement = operand->mem.disp.value;
 		}
 	}
-
-	if (!rsp_relative)
-		return false;
-
-    if (displacement)
-	{
-		*displacement = (size_t)(disp);
-	}
-	
 	return rsp_relative;
 }
 
@@ -324,260 +313,295 @@ void X86Assembler::TranslateJmp(ModuleInfo *module,
   }
 }
 
-void X86Assembler::InstrumentRet(ModuleInfo *module,
-                                 Instruction &inst,
-                                 size_t instruction_address,
-                                 TinyDBR::IndirectInstrumentation mode,
-                                 size_t bb_address) {
-  // lots of moving around, but the problem is
-  // we need to store context in the same place
-  // where the return address is
+void X86Assembler::InstrumentRet(ModuleInfo*                      module,
+								 Instruction&                     inst,
+								 size_t                           instruction_address,
+								 TinyDBR::IndirectInstrumentation mode,
+								 size_t                           bb_address)
+{
+	// lots of moving around, but the problem is
+	// we need to store context in the same place
+	// where the return address is
 
-  // at the end, the stack must be
-  // saved RAX
-  // saved EFLAGS
-  // <sp_offset>
-  // and RAX must contain return address
+	// at the end, the stack must be
+	// saved RAX
+	// saved EFLAGS
+	// <sp_offset>
+	// and RAX must contain return address
 
-  // store rax to a safe offset
-  int32_t ax_offset = -tinyinst_.sp_offset - 2 * tinyinst_.child_ptr_size;
-  WriteStack(module, ax_offset);
-  // copy return address to a safe offset
-  int32_t ret_offset = ax_offset - tinyinst_.child_ptr_size;
-  ReadStack(module, 0);
-  WriteStack(module, ret_offset);
-  // get ret immediate
-  int32_t imm = (int32_t)xed_decoded_inst_get_unsigned_immediate(&inst.xedd);
-  // align the stack
-  int32_t ret_pop =
-      (int32_t)tinyinst_.child_ptr_size + imm - tinyinst_.sp_offset;
-  OffsetStack(module, ret_pop);  // pop
-  ax_offset -= ret_pop;
-  ret_offset -= ret_pop;
-  // write data to stack
-  tinyinst_.WriteCode(module, PUSH_F, sizeof(PUSH_F));
-  ax_offset += tinyinst_.child_ptr_size;
-  ret_offset += tinyinst_.child_ptr_size;
-  ReadStack(module, ax_offset);
-  tinyinst_.WriteCode(module, PUSH_A, sizeof(PUSH_A));
-  ax_offset += tinyinst_.child_ptr_size;
-  ret_offset += tinyinst_.child_ptr_size;
-  ReadStack(module, ret_offset);
-  tinyinst_.InstrumentIndirect(module,
-                               inst,
-                               instruction_address,
-                               mode,
-                               bb_address);
+	const auto& zinst = inst.zinst;
+	// store rax to a safe offset
+	int32_t ax_offset = -tinyinst_.sp_offset - 2 * tinyinst_.child_ptr_size;
+	WriteStack(module, ax_offset);
+	// copy return address to a safe offset
+	int32_t ret_offset = ax_offset - tinyinst_.child_ptr_size;
+	ReadStack(module, 0);
+	WriteStack(module, ret_offset);
+	// get ret immediate
+	int32_t imm = zinst.instruction.raw.imm[0].value.u;
+	// align the stack
+	int32_t ret_pop =
+		(int32_t)tinyinst_.child_ptr_size + imm - tinyinst_.sp_offset;
+	OffsetStack(module, ret_pop);  // pop
+	ax_offset -= ret_pop;
+	ret_offset -= ret_pop;
+	// write data to stack
+	tinyinst_.WriteCode(module, PUSH_F, sizeof(PUSH_F));
+	ax_offset += tinyinst_.child_ptr_size;
+	ret_offset += tinyinst_.child_ptr_size;
+	ReadStack(module, ax_offset);
+	tinyinst_.WriteCode(module, PUSH_A, sizeof(PUSH_A));
+	ax_offset += tinyinst_.child_ptr_size;
+	ret_offset += tinyinst_.child_ptr_size;
+	ReadStack(module, ret_offset);
+	tinyinst_.InstrumentIndirect(module,
+								 inst,
+								 instruction_address,
+								 mode,
+								 bb_address);
 }
 
 // converts an indirect jump/call into a MOV instruction
 // which moves the target of the indirect call into the RAX/EAX register
 // and writes this instruction into the code buffer
-void X86Assembler::MovIndirectTarget(ModuleInfo *module,
-                                     Instruction &inst,
-                                     size_t original_address,
-                                     int32_t stack_offset) {
-  size_t mem_address = 0;
-  bool rip_relative =
-      IsRipRelative(module, inst, original_address, &mem_address);
+void X86Assembler::MovIndirectTarget(ModuleInfo*  module,
+									 Instruction& inst,
+									 size_t       original_address,
+									 int32_t      stack_offset)
+{
+	size_t mem_address = 0;
+	bool   rip_relative =
+		IsRipRelative(module, inst, original_address, &mem_address);
 
-  xed_error_enum_t xed_error;
-  uint32_t olen;
+	ZydisRegister dest_reg;
+	if (tinyinst_.child_ptr_size == 4)
+	{
+		dest_reg = ZYDIS_REGISTER_EAX;
+	}
+	else
+	{
+		dest_reg = ZYDIS_REGISTER_RAX;
+	}
 
-  const xed_inst_t *xi = xed_decoded_inst_inst(&inst.xedd);
-  const xed_operand_t *op = xed_inst_operand(xi, 0);
-  xed_operand_enum_t operand_name = xed_operand_name(op);
+	ZydisEncoderRequest mov;
+	memset(&mov, 0, sizeof(mov));
+	mov.mnemonic = ZYDIS_MNEMONIC_MOV;
 
-  xed_state_t dstate;
-  dstate.mmode = (xed_machine_mode_enum_t)tinyinst_.child_ptr_size == 8
-                     ? XED_MACHINE_MODE_LONG_64
-                     : XED_MACHINE_MODE_LEGACY_32;
-  dstate.stack_addr_width = (xed_address_width_enum_t)tinyinst_.child_ptr_size;
+	mov.machine_mode      = tinyinst_.child_ptr_size == 8
+								? ZYDIS_MACHINE_MODE_LONG_64
+								: ZYDIS_MACHINE_MODE_LEGACY_32;
+	mov.address_size_hint = tinyinst_.child_ptr_size == 8
+								? ZYDIS_ADDRESS_SIZE_HINT_64
+								: ZYDIS_ADDRESS_SIZE_HINT_32;
+	mov.operand_size_hint = tinyinst_.child_ptr_size == 8
+								? ZYDIS_OPERAND_SIZE_HINT_64
+								: ZYDIS_OPERAND_SIZE_HINT_32;
 
-  xed_reg_enum_t dest_reg;
-  if (tinyinst_.child_ptr_size == 4) {
-    dest_reg = XED_REG_EAX;
-  } else {
-    dest_reg = XED_REG_RAX;
-  }
+	mov.operand_count         = 2;
+	mov.operands[0].type      = ZYDIS_OPERAND_TYPE_REGISTER;
+	mov.operands[0].reg.value = dest_reg;
 
-  xed_encoder_request_t mov;
-  xed_encoder_request_zero_set_mode(&mov, &dstate);
-  xed_encoder_request_set_iclass(&mov, XED_ICLASS_MOV);
+	const auto& operand = inst.zinst.operands[0];
 
-  xed_encoder_request_set_effective_operand_width(
-      &mov, (uint32_t)(tinyinst_.child_ptr_size * 8));
-  xed_encoder_request_set_effective_address_size(
-      &mov, (uint32_t)(tinyinst_.child_ptr_size * 8));
+	if (operand.type == ZYDIS_OPERAND_TYPE_MEMORY)
+	{
+		mov.operands[1].type      = ZYDIS_OPERAND_TYPE_MEMORY;
+		mov.operands[1].mem.base  = operand.mem.base;
+		mov.operands[1].mem.index = operand.mem.index;
+		mov.operands[1].mem.scale = operand.mem.scale;
+		mov.operands[1].mem.size  = operand.size / 8;
 
-  xed_encoder_request_set_reg(&mov, XED_OPERAND_REG0, dest_reg);
-  xed_encoder_request_set_operand_order(&mov, 0, XED_OPERAND_REG0);
+		// in an unlikely case where base is rsp, disp needs fixing
+		// this is because we pushed stuff on the stack
+		const auto& base = operand.mem.base;
+		if ((base == ZYDIS_REGISTER_SP) ||
+			(base == ZYDIS_REGISTER_ESP) ||
+			(base == ZYDIS_REGISTER_RSP))
+		{
+			// printf("base = sp\n");
+			int64_t disp = operand.mem.disp.value + stack_offset;
+			mov.operands[1].mem.displacement = disp;
+		}
+		else
+		{
+			mov.operands[1].mem.displacement = operand.mem.disp.value;
+		}
+	}
+	else if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER)
+	{
+		mov.operands[1].type      = ZYDIS_OPERAND_TYPE_REGISTER;
+		mov.operands[1].reg.value = operand.reg.value;
+	}
+	else
+	{
+		FATAL("Unexpected operand in indirect jump/call");
+	}
 
-  if (operand_name == XED_OPERAND_MEM0) {
-    xed_encoder_request_set_mem0(&mov);
-    xed_reg_enum_t base_reg = xed_decoded_inst_get_base_reg(&inst.xedd, 0);
-    xed_encoder_request_set_base0(&mov, base_reg);
-    xed_encoder_request_set_seg0(&mov, xed_decoded_inst_get_seg_reg(&inst.xedd, 0));
-    xed_encoder_request_set_index(&mov,
-                                  xed_decoded_inst_get_index_reg(&inst.xedd, 0));
-    xed_encoder_request_set_scale(&mov, xed_decoded_inst_get_scale(&inst.xedd, 0));
-    // in an unlikely case where base is rsp, disp needs fixing
-    // this is because we pushed stuff on the stack
-    if ((base_reg == XED_REG_SP) || (base_reg == XED_REG_ESP) ||
-        (base_reg == XED_REG_RSP)) {
-      // printf("base = sp\n");
-      int64_t disp =
-          xed_decoded_inst_get_memory_displacement(&inst.xedd, 0) + stack_offset;
-      // always use disp width 4 in this case
-      xed_encoder_request_set_memory_displacement(&mov, disp, 4);
-    } else {
-      xed_encoder_request_set_memory_displacement(
-          &mov, xed_decoded_inst_get_memory_displacement(&inst.xedd, 0),
-          xed_decoded_inst_get_memory_displacement_width(&inst.xedd, 0));
-    }
-    xed_encoder_request_set_memory_operand_length(
-        &mov, xed_decoded_inst_get_memory_operand_length(&inst.xedd, 0));
-    xed_encoder_request_set_operand_order(&mov, 1, XED_OPERAND_MEM0);
-  } else if (operand_name == XED_OPERAND_REG0) {
-    xed_encoder_request_set_reg(
-        &mov,
-        XED_OPERAND_REG1,
-        xed_decoded_inst_get_reg(&inst.xedd, XED_OPERAND_REG0));
-    xed_encoder_request_set_operand_order(&mov, 1, XED_OPERAND_REG1);
-  } else {
-    FATAL("Unexpected operand in indirect jump/call");
-  }
+	ZyanU8     encoded_instruction[ZYDIS_MAX_INSTRUCTION_LENGTH] = { 0 };
+	ZyanUSize  encoded_length                                    = sizeof(encoded_instruction);
+	ZyanStatus zstatus = ZydisEncoderEncodeInstruction(&mov, encoded_instruction, &encoded_length);
+	if (ZYAN_FAILED(zstatus))
+	{
+		FATAL("Error encoding instruction");
+	}
 
-  unsigned char encoded[15];
-  xed_error = xed_encode(&mov, encoded, sizeof(encoded), &olen);
-  if (xed_error != XED_ERROR_NONE) {
-    FATAL("Error encoding instruction");
-  }
+	if (rip_relative)
+	{
+		// fix displacement
+		size_t  out_instruction_size = encoded_length;
+		int64_t fixed_disp =
+			(int64_t)mem_address -
+			(int64_t)((size_t)module->instrumented_code_remote +
+					  module->instrumented_code_allocated +
+					  out_instruction_size);
+		mov.operands[1].mem.displacement = fixed_disp;
+		encoded_length                   = sizeof(encoded_instruction);
+		zstatus                          = ZydisEncoderEncodeInstruction(&mov, encoded_instruction, &encoded_length);
+		if (ZYAN_FAILED(zstatus))
+		{
+			FATAL("Error encoding instruction");
+		}
 
-  if (rip_relative) {
-    // fix displacement
-    size_t out_instruction_size = olen;
-    int64_t fixed_disp =
-        (int64_t)mem_address -
-        (int64_t)((size_t)module->instrumented_code_remote +
-                  module->instrumented_code_allocated +
-                  out_instruction_size);
-    xed_encoder_request_set_memory_displacement(&mov, fixed_disp, 4);
-    xed_error = xed_encode(&mov, encoded, sizeof(encoded), &olen);
-    if (xed_error != XED_ERROR_NONE) {
-      FATAL("Error encoding instruction");
-    }
-    if (olen != out_instruction_size) {
-      FATAL("Unexpected instruction size");
-    }
-  }
+		if (encoded_length != out_instruction_size)
+		{
+			FATAL("Unexpected instruction size");
+		}
+	}
 
-  tinyinst_.WriteCode(module, encoded, olen);
+	tinyinst_.WriteCode(module, encoded_instruction, encoded_length);
 }
 
 // translates indirect jump or call
 // using global jumptable
-void X86Assembler::InstrumentGlobalIndirect(ModuleInfo *module,
-                                            Instruction &inst,
-                                            size_t instruction_address) {
-  if (xed_decoded_inst_get_category(&inst.xedd) != XED_CATEGORY_RET) {
-    if (tinyinst_.sp_offset) {
-      OffsetStack(module, -tinyinst_.sp_offset);
-    }
+void X86Assembler::InstrumentGlobalIndirect(ModuleInfo*  module,
+											Instruction& inst,
+											size_t       instruction_address)
+{
 
-    // push eflags
-    // push RAX
-    // push RBX
-    tinyinst_.WriteCode(module, PUSH_FAB, sizeof(PUSH_FAB));
+	auto category = inst.zinst.instruction.meta.category;
+	if (category != ZYDIS_CATEGORY_RET)
+	{
+		if (tinyinst_.sp_offset)
+		{
+			OffsetStack(module, -tinyinst_.sp_offset);
+		}
 
-    int32_t stack_offset = tinyinst_.sp_offset + 3 * tinyinst_.child_ptr_size;
+		// push eflags
+		// push RAX
+		// push RBX
+		tinyinst_.WriteCode(module, PUSH_FAB, sizeof(PUSH_FAB));
 
-    if (xed_decoded_inst_get_category(&inst.xedd) == XED_CATEGORY_CALL) {
-      stack_offset += tinyinst_.child_ptr_size;
-    }
+		int32_t stack_offset = tinyinst_.sp_offset + 3 * tinyinst_.child_ptr_size;
 
-    MovIndirectTarget(module, inst, instruction_address, stack_offset);
-  } else {
-    // stack already set up, just push RBX
-    tinyinst_.WriteCode(module, PUSH_B, sizeof(PUSH_B));
-  }
+		if (category == ZYDIS_CATEGORY_CALL)
+		{
+			stack_offset += tinyinst_.child_ptr_size;
+		}
 
-  // mov rbx, rax
-  // and rbx, (JUMPTABLE_SIZE - 1) * child_ptr_size
-  if (tinyinst_.child_ptr_size == 8) {
-    tinyinst_.WriteCode(module, MOV_RBXRAX, sizeof(MOV_RBXRAX));
-    tinyinst_.WriteCode(module, AND_RBX, sizeof(AND_RBX));
-  } else {
-    tinyinst_.WriteCode(module, MOV_EBXEAX, sizeof(MOV_EBXEAX));
-    tinyinst_.WriteCode(module, AND_EBX, sizeof(AND_EBX));
-  }
-  FixDisp4(module, (int32_t)((JUMPTABLE_SIZE - 1) * tinyinst_.child_ptr_size));
+		MovIndirectTarget(module, inst, instruction_address, stack_offset);
+	}
+	else
+	{
+		// stack already set up, just push RBX
+		tinyinst_.WriteCode(module, PUSH_B, sizeof(PUSH_B));
+	}
 
-  // add rbx, [jumptable_address]
-  if (tinyinst_.child_ptr_size == 8) {
-    tinyinst_.WriteCode(module, ADD_RBXRIPRELATIVE, sizeof(ADD_RBXRIPRELATIVE));
-    FixDisp4(module, (int32_t)((int64_t)module->jumptable_address_offset -
-                               (int64_t)module->instrumented_code_allocated));
-  } else {
-    tinyinst_.WriteCode(module, ADD_EBXRIPRELATIVE, sizeof(ADD_EBXRIPRELATIVE));
-    FixDisp4(module, (int32_t)((size_t)module->instrumented_code_remote +
-                               module->jumptable_address_offset));
-  }
+	// mov rbx, rax
+	// and rbx, (JUMPTABLE_SIZE - 1) * child_ptr_size
+	if (tinyinst_.child_ptr_size == 8)
+	{
+		tinyinst_.WriteCode(module, MOV_RBXRAX, sizeof(MOV_RBXRAX));
+		tinyinst_.WriteCode(module, AND_RBX, sizeof(AND_RBX));
+	}
+	else
+	{
+		tinyinst_.WriteCode(module, MOV_EBXEAX, sizeof(MOV_EBXEAX));
+		tinyinst_.WriteCode(module, AND_EBX, sizeof(AND_EBX));
+	}
+	FixDisp4(module, (int32_t)((JUMPTABLE_SIZE - 1) * tinyinst_.child_ptr_size));
 
-  // jmp [RBX]
-  tinyinst_.WriteCode(module, JMP_B, sizeof(JMP_B));
+	// add rbx, [jumptable_address]
+	if (tinyinst_.child_ptr_size == 8)
+	{
+		tinyinst_.WriteCode(module, ADD_RBXRIPRELATIVE, sizeof(ADD_RBXRIPRELATIVE));
+		FixDisp4(module, (int32_t)((int64_t)module->jumptable_address_offset -
+								   (int64_t)module->instrumented_code_allocated));
+	}
+	else
+	{
+		tinyinst_.WriteCode(module, ADD_EBXRIPRELATIVE, sizeof(ADD_EBXRIPRELATIVE));
+		FixDisp4(module, (int32_t)((size_t)module->instrumented_code_remote +
+								   module->jumptable_address_offset));
+	}
+
+	// jmp [RBX]
+	tinyinst_.WriteCode(module, JMP_B, sizeof(JMP_B));
 }
 
 // translates indirect jump or call
 // using local jumptable
-void X86Assembler::InstrumentLocalIndirect(ModuleInfo *module,
-                                           Instruction &inst,
-                                           size_t instruction_address,
-                                           size_t bb_address) {
-  if (xed_decoded_inst_get_category(&inst.xedd) != XED_CATEGORY_RET) {
-    if (tinyinst_.sp_offset) {
-      OffsetStack(module, -tinyinst_.sp_offset);
-    }
+void X86Assembler::InstrumentLocalIndirect(ModuleInfo*  module,
+										   Instruction& inst,
+										   size_t       instruction_address,
+										   size_t       bb_address)
+{
+	auto category = inst.zinst.instruction.meta.category;
+	if (category != ZYDIS_CATEGORY_RET)
+	{
+		if (tinyinst_.sp_offset)
+		{
+			OffsetStack(module, -tinyinst_.sp_offset);
+		}
 
-    // push eflags
-    // push RAX
-    tinyinst_.WriteCode(module, PUSH_FA, sizeof(PUSH_FA));
+		// push eflags
+		// push RAX
+		tinyinst_.WriteCode(module, PUSH_FA, sizeof(PUSH_FA));
 
-    int32_t stack_offset = tinyinst_.sp_offset + 2 * tinyinst_.child_ptr_size;
+		int32_t stack_offset = tinyinst_.sp_offset + 2 * tinyinst_.child_ptr_size;
 
-    if (xed_decoded_inst_get_category(&inst.xedd) == XED_CATEGORY_CALL) {
-      stack_offset += tinyinst_.child_ptr_size;
-    }
+		if (category == ZYDIS_CATEGORY_CALL)
+		{
+			stack_offset += tinyinst_.child_ptr_size;
+		}
 
-    MovIndirectTarget(module, inst, instruction_address, stack_offset);
-  } else {
-    // stack already set up
-  }
+		MovIndirectTarget(module, inst, instruction_address, stack_offset);
+	}
+	else
+	{
+		// stack already set up
+	}
 
-  // jmp [breakpoint]
-  tinyinst_.WriteCode(module, JMP_MEM, sizeof(JMP_MEM));
+	// jmp [breakpoint]
+	tinyinst_.WriteCode(module, JMP_MEM, sizeof(JMP_MEM));
 
-  size_t breakpoint_address = tinyinst_.GetCurrentInstrumentedAddress(module);
+	size_t breakpoint_address = tinyinst_.GetCurrentInstrumentedAddress(module);
 
-  if (tinyinst_.child_ptr_size == 8) {
-    FixDisp4(module, 1);
-  } else {
-    FixDisp4(module, (int32_t)(breakpoint_address + 1));
-  }
+	if (tinyinst_.child_ptr_size == 8)
+	{
+		FixDisp4(module, 1);
+	}
+	else
+	{
+		FixDisp4(module, (int32_t)(breakpoint_address + 1));
+	}
 
-  // int3
-  Breakpoint(module);
-  module->br_indirect_newtarget_list[breakpoint_address] = {
-      module->instrumented_code_allocated, bb_address};
+	// int3
+	Breakpoint(module);
+	module->br_indirect_newtarget_list[breakpoint_address] = {
+		module->instrumented_code_allocated, bb_address
+	};
 
-  // breakpoint_address
-  if (tinyinst_.child_ptr_size == 8) {
-    uint64_t address = (uint64_t)breakpoint_address;
-    tinyinst_.WriteCode(module, &address, sizeof(address));
-  } else {
-    uint32_t address = (uint32_t)breakpoint_address;
-    tinyinst_.WriteCode(module, &address, sizeof(address));
-  }
+	// breakpoint_address
+	if (tinyinst_.child_ptr_size == 8)
+	{
+		uint64_t address = (uint64_t)breakpoint_address;
+		tinyinst_.WriteCode(module, &address, sizeof(address));
+	}
+	else
+	{
+		uint32_t address = (uint32_t)breakpoint_address;
+		tinyinst_.WriteCode(module, &address, sizeof(address));
+	}
 }
 
 // pushes return address on the target stack
@@ -602,142 +626,210 @@ void X86Assembler::PushReturnAddress(ModuleInfo *module,
   }
 }
 
+const ZydisDecodedOperand* X86Assembler::FindExplicitMemoryOperand(
+	const Instruction& inst,
+	size_t*            index)
+{
+	const auto& zinst          = inst.zinst;
+	size_t      explicit_count = zinst.instruction.operand_count_visible;
+	for (size_t i = 0; i != explicit_count; ++i)
+	{
+		if (zinst.operands[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			zinst.operands[i].visibility == ZYDIS_OPERAND_VISIBILITY_EXPLICIT)
+		{
+			if (index)
+			{
+				*index = i;
+			}
+			return &zinst.operands[i];
+		}
+	}
+	return nullptr;
+}
+
+// detect if instruction is indirect jmp or call
+bool X86Assembler::IsIndirectBranch(Instruction& inst)
+{
+	auto brance_type  = inst.zinst.instruction.meta.branch_type;
+	if (brance_type == ZYDIS_BRANCH_TYPE_NONE)
+	{
+		return false;
+	}
+
+	// must have a operand
+	auto operand_type = inst.zinst.operands[0].type;
+	return operand_type == ZYDIS_OPERAND_TYPE_REGISTER || operand_type == ZYDIS_OPERAND_TYPE_MEMORY;
+}
+
 // outputs instruction into the translated code buffer
 // fixes stuff like rip-relative addressing
 void X86Assembler::FixInstructionAndOutput(
-    ModuleInfo *module,
-    Instruction &inst,
-    const unsigned char *input,
-    const unsigned char *input_address_remote,
-    bool convert_call_to_jmp) {
-  size_t mem_address = 0;
-  bool rip_relative =
-      IsRipRelative(module, inst, (size_t)input_address_remote, &mem_address);
+	ModuleInfo*          module,
+	Instruction&         inst,
+	const unsigned char* input,
+	const unsigned char* input_address_remote,
+	bool                 convert_call_to_jmp)
+{
+	size_t mem_address = 0;
+	bool   rip_relative =
+		IsRipRelative(module, inst, (size_t)input_address_remote, &mem_address);
+	const auto& zinst = inst.zinst;
 
-  size_t original_instruction_size = xed_decoded_inst_get_length(&inst.xedd);
+	size_t original_instruction_size = zinst.instruction.length;
 
-  bool needs_fixing = rip_relative || convert_call_to_jmp;
+	bool needs_fixing = rip_relative || convert_call_to_jmp;
 
-  // fast path
-  // just copy instruction bytes without encoding
-  if (!needs_fixing) {
-    tinyinst_.WriteCode(module, (void *)input, original_instruction_size);
-    return;
-  }
+	// fast path
+	// just copy instruction bytes without encoding
+	if (!needs_fixing)
+	{
+		tinyinst_.WriteCode(module, (void*)input, original_instruction_size);
+		return;
+	}
 
-  unsigned int olen;
-  xed_encoder_request_init_from_decode(&inst.xedd);
-  xed_error_enum_t xed_error;
-  unsigned char tmp[15];
+	ZydisEncoderRequest req     = {};
+	ZyanStatus          zstatus = ZydisEncoderDecodedInstructionToEncoderRequest(
+        &zinst.instruction,
+        zinst.operands,
+        zinst.instruction.operand_count_visible,
+        &req);
 
-  if (convert_call_to_jmp) {
-    xed_encoder_request_set_iclass(&inst.xedd, XED_ICLASS_JMP);
-  }
+	ZyanU8    encoded_instruction[ZYDIS_MAX_INSTRUCTION_LENGTH] = { 0 };
+	ZyanUSize encoded_length                                    = sizeof(encoded_instruction);
 
-  if (!rip_relative) {
-    xed_error = xed_encode(&inst.xedd, tmp, sizeof(tmp), &olen);
-    if (xed_error != XED_ERROR_NONE) {
-      FATAL("Error encoding instruction");
-    }
-    tinyinst_.WriteCode(module, tmp, olen);
-    return;
-  }
+	if (convert_call_to_jmp)
+	{
+		req.mnemonic = ZYDIS_MNEMONIC_JMP;
+	}
 
-  size_t instruction_end_addr;
-  int64_t fixed_disp;
+	if (!rip_relative)
+	{
+		zstatus = ZydisEncoderEncodeInstruction(&req, encoded_instruction, &encoded_length);
+		if (ZYAN_FAILED(zstatus))
+		{
+			FATAL("Error encoding instruction");
+		}
+		tinyinst_.WriteCode(module, encoded_instruction, encoded_length);
+		return;
+	}
 
-  instruction_end_addr = (size_t)module->instrumented_code_remote +
-                         module->instrumented_code_allocated +
-                         original_instruction_size;
+	size_t  instruction_end_addr;
+	int64_t fixed_disp;
 
-  // encode an instruction once just to get the instruction size
-  // as it needs not be the original size
-  fixed_disp = (int64_t)(mem_address) - (int64_t)(instruction_end_addr);
+	instruction_end_addr = (size_t)module->instrumented_code_remote +
+						   module->instrumented_code_allocated +
+						   original_instruction_size;
 
-  if (llabs(fixed_disp) > 0x7FFFFFFF) FATAL("Offset larger than 2G");
+	// encode an instruction once just to get the instruction size
+	// as it needs not be the original size
+	fixed_disp = (int64_t)(mem_address) - (int64_t)(instruction_end_addr);
 
-  xed_encoder_request_set_memory_displacement(&inst.xedd, fixed_disp, 4);
-  xed_error = xed_encode(&inst.xedd, tmp, sizeof(tmp), &olen);
-  if (xed_error != XED_ERROR_NONE) {
-    FATAL("Error encoding instruction");
-  }
+	if (llabs(fixed_disp) > 0x7FFFFFFF)
+		FATAL("Offset larger than 2G");
 
-  size_t out_instruction_size = olen;
-  if ((module->instrumented_code_allocated + out_instruction_size) >
-      module->instrumented_code_size) {
-    FATAL("Insufficient memory allocated for instrumented code");
-  }
+	size_t mem_idx = 0;
+	auto   operand = FindExplicitMemoryOperand(inst, &mem_idx);
+	if (!operand)
+	{
+		FATAL("No memory operand for a rip-relative instruction.");
+	}
 
-  instruction_end_addr = (size_t)module->instrumented_code_remote +
-                         module->instrumented_code_allocated +
-                         out_instruction_size;
+	encoded_length                         = sizeof(encoded_instruction);
+	req.operands[mem_idx].mem.displacement = fixed_disp;
 
-  fixed_disp = (int64_t)(mem_address) - (int64_t)(instruction_end_addr);
+	zstatus = ZydisEncoderEncodeInstruction(&req, encoded_instruction, &encoded_length);
+	if (ZYAN_FAILED(zstatus))
+	{
+		FATAL("Error encoding instruction");
+	}
 
-  if (llabs(fixed_disp) > 0x7FFFFFFF) FATAL("Offset larger than 2G");
+	size_t out_instruction_size = encoded_length;
+	if ((module->instrumented_code_allocated + out_instruction_size) >
+		module->instrumented_code_size)
+	{
+		FATAL("Insufficient memory allocated for instrumented code");
+	}
 
-  xed_encoder_request_set_memory_displacement(&inst.xedd, fixed_disp, 4);
-  xed_error = xed_encode(&inst.xedd,
-                         (unsigned char *)(module->instrumented_code_local +
-                                           module->instrumented_code_allocated),
-                         (uint32_t)(module->instrumented_code_size -
-                                    module->instrumented_code_allocated),
-                         &olen);
+	instruction_end_addr = (size_t)module->instrumented_code_remote +
+						   module->instrumented_code_allocated +
+						   out_instruction_size;
 
-  if (xed_error != XED_ERROR_NONE) {
-    FATAL("Error encoding instruction");
-  }
-  if (olen != out_instruction_size) {
-    FATAL("Unexpected instruction size");
-  }
+	fixed_disp = (int64_t)(mem_address) - (int64_t)(instruction_end_addr);
 
-  module->instrumented_code_allocated += olen;
+	if (llabs(fixed_disp) > 0x7FFFFFFF)
+		FATAL("Offset larger than 2G");
+
+	encoded_length                         = sizeof(encoded_instruction);
+	req.operands[mem_idx].mem.displacement = fixed_disp;
+	zstatus                                = ZydisEncoderEncodeInstruction(&req, encoded_instruction, &encoded_length);
+	if (ZYAN_FAILED(zstatus))
+	{
+		FATAL("Error encoding instruction");
+	}
+
+	void* code_buffer = module->instrumented_code_local +
+						module->instrumented_code_allocated;
+	memcpy(code_buffer, encoded_instruction, encoded_length);
+
+	if (encoded_length != out_instruction_size)
+	{
+		FATAL("Unexpected instruction size");
+	}
+
+	module->instrumented_code_allocated += encoded_length;
 }
 
-bool X86Assembler::DecodeInstruction(Instruction &inst,
-                                     const unsigned char *buffer,
-                                     unsigned int buffer_size) {
-  xed_state_t dstate;
-  dstate.mmode = (xed_machine_mode_enum_t)tinyinst_.child_ptr_size == 8
-                     ? XED_MACHINE_MODE_LONG_64
-                     : XED_MACHINE_MODE_LEGACY_32;
-  dstate.stack_addr_width = (xed_address_width_enum_t)tinyinst_.child_ptr_size;
 
-  xed_decoded_inst_zero_set_mode(&inst.xedd, &dstate);
-  xed_error_enum_t xed_error = xed_decode(&inst.xedd, buffer, buffer_size);
+bool X86Assembler::DecodeInstruction(Instruction&         inst,
+									 const unsigned char* buffer,
+									 unsigned int         buffer_size)
+{
 
-  if (xed_error != XED_ERROR_NONE) return false;
+	ZyanStatus zstatus = ZydisDecoderDecodeFull(&decoder, buffer, buffer_size,
+												&inst.zinst.instruction, inst.zinst.operands, ZYDIS_MAX_OPERAND_COUNT,
+												0);
+	if (ZYAN_FAILED(zstatus))
+		return false;
 
-  inst.address = (size_t)buffer;
-  inst.length = xed_decoded_inst_get_length(&inst.xedd);
-  inst.bbend = false;
-  xed_category_enum_t category = xed_decoded_inst_get_category(&inst.xedd);
-  xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&inst.xedd);
+	inst.address                 = (size_t)buffer;
+	inst.length                  = inst.zinst.instruction.length;
+	inst.bbend                   = false;
 
-  switch (category) {
-    case XED_CATEGORY_CALL:
-    case XED_CATEGORY_RET:
-    case XED_CATEGORY_UNCOND_BR:
-    case XED_CATEGORY_COND_BR:
-      inst.bbend = true;
-      break;
-    default:
-      break;
-  }
+	ZydisInstructionCategory category    = inst.zinst.instruction.meta.category;
+	ZydisMnemonic            mnemonic    = inst.zinst.instruction.mnemonic;
+	ZydisBranchType          branch_type = inst.zinst.instruction.meta.branch_type;
 
-  if (category == XED_CATEGORY_RET && iclass == XED_ICLASS_RET_NEAR) {
-    inst.iclass = InstructionClass::RET;
-  }
-  else if(iclass == XED_ICLASS_JMP) {
-    inst.iclass = InstructionClass::IJUMP;
-  }
-  else if(iclass == XED_ICLASS_CALL_NEAR) {
-    inst.iclass = InstructionClass::ICALL;
-  }
-  else {
-    inst.iclass = InstructionClass::OTHER;
-  }
-  return true;
+	switch (category)
+	{
+	case ZYDIS_CATEGORY_CALL:
+	case ZYDIS_CATEGORY_RET:
+	case ZYDIS_CATEGORY_UNCOND_BR:
+	case ZYDIS_CATEGORY_COND_BR:
+		inst.bbend = true;
+		break;
+	default:
+		break;
+	}
+
+	inst.iclass = InstructionClass::OTHER;
+	if (branch_type == ZYDIS_BRANCH_TYPE_NEAR || branch_type == ZYDIS_BRANCH_TYPE_SHORT)
+	{
+		if (category == ZYDIS_CATEGORY_RET &&
+			mnemonic == ZYDIS_MNEMONIC_RET)
+		{
+			inst.iclass = InstructionClass::RET;
+		}
+		else if (mnemonic == ZYDIS_MNEMONIC_JMP)
+		{
+			inst.iclass = InstructionClass::IJUMP;
+		}
+		else if (mnemonic == ZYDIS_MNEMONIC_CALL)
+		{
+			inst.iclass = InstructionClass::ICALL;
+		}
+	}
+
+	return true;
 }
 
 // fixes an offset in the jump instruction (at offset jmp_offset in the
@@ -752,349 +844,406 @@ void X86Assembler::FixOffset(ModuleInfo *module,
     jmp_relative_offset;
 }
 
-void X86Assembler::HandleBasicBlockEnd(
-    const char *address,
-    ModuleInfo *module,
-    std::set<char *> *queue,
-    std::list<std::pair<uint32_t, uint32_t>> *offset_fixes,
-    Instruction &inst,
-    const char *code_ptr,
-    size_t offset,
-    size_t last_offset) {
-  xed_error_enum_t xed_error;
-  xed_category_enum_t category = xed_decoded_inst_get_category(&inst.xedd);
-  if (category == XED_CATEGORY_RET) {
-    TinyDBR::IndirectInstrumentation ii_mode =
-      tinyinst_.ShouldInstrumentIndirect(module,
-                                         inst,
-                                         (size_t)address + last_offset);
+void X86Assembler::PrintInstruction(const Instruction& inst)
+{
+#ifdef _DEBUG
+	const auto& zinst = inst.zinst;
+	char buffer[256];
+	ZydisFormatterFormatInstruction(&formatter,
+									&zinst.instruction, zinst.operands,
+									zinst.instruction.operand_count_visible,
+									buffer, sizeof(buffer), inst.address);
 
-    if (ii_mode != TinyDBR::IndirectInstrumentation::II_NONE) {
-      InstrumentRet(module, inst, (size_t)address + last_offset, ii_mode,
-                    (size_t)address);
-    } else {
-      FixInstructionAndOutput(
-        module,
-        inst,
-        (unsigned char *)(code_ptr + last_offset),
-        (unsigned char *)(address + last_offset));
-    }
+	printf("%016" PRIX64 "  ", inst.address);
+	for (size_t i = 0; i != zinst.instruction.length; ++i)
+	{
+		uint8_t byte = ((uint8_t*)inst.address)[i];
+		printf("%02X ", byte);
+	}
+	printf(" %s\n", buffer);
 
-  } else if (category == XED_CATEGORY_COND_BR) {
-    // j* target_address
-    // gets instrumented as:
-    //   j* label
-    //   <edge instrumentation>
-    //   jmp continue_address
-    // label:
-    //   <edge instrumentation>
-    //   jmp target_address
-
-    // must have an operand
-    const xed_inst_t *xi = xed_decoded_inst_inst(&inst.xedd);
-    const xed_operand_t *op = xed_inst_operand(xi, 0);
-    xed_operand_enum_t operand_name = xed_operand_name(op);
-
-    if (operand_name != XED_OPERAND_RELBR) {
-      FATAL("Error getting branch target");
-    }
-
-    int32_t disp = xed_decoded_inst_get_branch_displacement(&inst.xedd);
-    uint32_t disp_width =
-        xed_decoded_inst_get_branch_displacement_width(&inst.xedd);
-    if (disp_width == 0) {
-      FATAL("Error getting branch target");
-    }
-
-    const char *target_address1 = address + offset;
-    const char *target_address2 = address + offset + disp;
-
-    if (tinyinst_.GetModule((size_t)target_address2) != module) {
-      WARN("Relative jump to a differen module in bb at %p\n", address);
-      tinyinst_.InvalidInstruction(module);
-      return;
-    }
-
-    // preliminary encode jump instruction
-    // displacement might be changed later as we don't know
-    // the size of edge instrumentation yet
-    // assuming 0 for now
-    int32_t fixed_disp = sizeof(JMP);
-    unsigned char encoded[15];
-    unsigned int olen;
-    unsigned int jump_size;
-    xed_encoder_request_init_from_decode(&inst.xedd);
-    xed_encoder_request_set_branch_displacement(&inst.xedd,
-                                                fixed_disp,
-                                                disp_width);
-    xed_error = xed_encode(&inst.xedd, encoded, sizeof(encoded), &olen);
-    if (xed_error != XED_ERROR_NONE) {
-      FATAL("Error encoding instruction");
-    }
-    jump_size = olen;
-    size_t jump_start_offset = module->instrumented_code_allocated;
-    tinyinst_.WriteCode(module, encoded, jump_size);
-    size_t jump_end_offset = module->instrumented_code_allocated;
-
-    // instrument the 1st edge
-    tinyinst_.InstrumentEdge(module, module, (size_t)address,
-                             (size_t)target_address1);
-
-    // jmp target_address1
-    tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-    tinyinst_.FixOffsetOrEnqueue(
-        module,
-        (uint32_t)((size_t)target_address1 - (size_t)(module->min_address)),
-        (uint32_t)(module->instrumented_code_allocated - 4), queue,
-        offset_fixes);
-
-    // time to fix that conditional jump offset
-    if ((module->instrumented_code_allocated - jump_end_offset) != fixed_disp) {
-      fixed_disp =
-          (int32_t)(module->instrumented_code_allocated - jump_end_offset);
-      xed_encoder_request_set_branch_displacement(&inst.xedd,
-                                                  fixed_disp,
-                                                  disp_width);
-      xed_error = xed_encode(&inst.xedd, encoded, sizeof(encoded), &olen);
-      if (xed_error != XED_ERROR_NONE) {
-        FATAL("Error encoding instruction");
-      }
-      if (jump_size != olen) {
-        FATAL("Instruction size changed?");
-      }
-      tinyinst_.WriteCodeAtOffset(module, jump_start_offset, encoded,
-                                  jump_size);
-    }
-
-    // instrument the 2nd edge
-    tinyinst_.InstrumentEdge(module, module, (size_t)address,
-                             (size_t)target_address2);
-
-    // jmp target_address2
-    tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-    tinyinst_.FixOffsetOrEnqueue(
-        module,
-        (uint32_t)((size_t)target_address2 - (size_t)(module->min_address)),
-        (uint32_t)(module->instrumented_code_allocated - 4),
-        queue,
-        offset_fixes);
-
-  } else if (category == XED_CATEGORY_UNCOND_BR) {
-    // must have an operand
-    const xed_inst_t *xi = xed_decoded_inst_inst(&inst.xedd);
-    const xed_operand_t *op = xed_inst_operand(xi, 0);
-
-    xed_operand_enum_t operand_name = xed_operand_name(op);
-
-    if (operand_name == XED_OPERAND_RELBR) {
-      // jmp address
-      // gets instrumented as:
-      // jmp fixed_address
-
-      int32_t disp = xed_decoded_inst_get_branch_displacement(&inst.xedd);
-      uint32_t disp_width =
-          xed_decoded_inst_get_branch_displacement_width(&inst.xedd);
-      if (disp_width == 0) {
-        FATAL("Error getting branch target");
-      }
-
-      const char *target_address = address + offset + disp;
-
-      if (tinyinst_.GetModule((size_t)target_address) != module) {
-        WARN("Relative jump to a differen module in bb at %p\n", address);
-        tinyinst_.InvalidInstruction(module);
-        return;
-      }
-
-      // jmp target_address
-      tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-      tinyinst_.FixOffsetOrEnqueue(
-          module,
-          (uint32_t)((size_t)target_address - (size_t)(module->min_address)),
-          (uint32_t)(module->instrumented_code_allocated - 4), queue,
-          offset_fixes);
-
-    } else {
-      TinyDBR::IndirectInstrumentation ii_mode =
-        tinyinst_.ShouldInstrumentIndirect(module,
-                                           inst,
-                                           (size_t)address + last_offset);
-
-      if (ii_mode != TinyDBR::IndirectInstrumentation::II_NONE) {
-        tinyinst_.InstrumentIndirect(module, inst,
-                                     (size_t)address + last_offset, ii_mode,
-                                     (size_t)address);
-      } else {
-        FixInstructionAndOutput(
-          module,
-          inst,
-          (unsigned char *)(code_ptr + last_offset),
-          (unsigned char *)(address + last_offset));
-      }
-    }
-
-  } else if (category == XED_CATEGORY_CALL) {
-    // must have an operand
-    const xed_inst_t *xi = xed_decoded_inst_inst(&inst.xedd);
-    const xed_operand_t *op = xed_inst_operand(xi, 0);
-
-    xed_operand_enum_t operand_name = xed_operand_name(op);
-
-    if (operand_name == XED_OPERAND_RELBR) {
-      // call target_address
-      // gets instrumented as:
-      //   call label
-      //   jmp return_address
-      // label:
-      //   jmp target_address
-
-      int32_t disp = xed_decoded_inst_get_branch_displacement(&inst.xedd);
-      uint32_t disp_width =
-          xed_decoded_inst_get_branch_displacement_width(&inst.xedd);
-      if (disp_width == 0) {
-        FATAL("Error getting branch target");
-      }
-
-      const char *return_address = address + offset;
-      const char *call_address = address + offset + disp;
-
-      if (tinyinst_.GetModule((size_t)call_address) != module) {
-        WARN("Relative jump to a differen module in bb at %p\n", address);
-        tinyinst_.InvalidInstruction(module);
-        return;
-      }
-
-      // fix the displacement and emit the call
-      if (!tinyinst_.patch_return_addresses) {
-        unsigned char encoded[15];
-        unsigned int olen;
-        xed_encoder_request_init_from_decode(&inst.xedd);
-        xed_encoder_request_set_branch_displacement(&inst.xedd,
-                                                    sizeof(JMP),
-                                                    disp_width);
-        xed_error = xed_encode(&inst.xedd, encoded, sizeof(encoded), &olen);
-        if (xed_error != XED_ERROR_NONE) {
-          FATAL("Error encoding instruction");
-        }
-        tinyinst_.WriteCode(module, encoded, olen);
-
-        size_t translated_return_address = tinyinst_.GetCurrentInstrumentedAddress(module);
-        tinyinst_.OnReturnAddress(module, (size_t)return_address, translated_return_address);
-
-        // jmp return_address
-        tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-        tinyinst_.FixOffsetOrEnqueue(
-            module,
-            (uint32_t)((size_t)return_address - (size_t)(module->min_address)),
-            (uint32_t)(module->instrumented_code_allocated - 4), queue,
-            offset_fixes);
-
-        // jmp call_address
-        tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-        tinyinst_.FixOffsetOrEnqueue(
-            module,
-            (uint32_t)((size_t)call_address - (size_t)(module->min_address)),
-            (uint32_t)(module->instrumented_code_allocated - 4), queue,
-            offset_fixes);
-
-      } else {
-        PushReturnAddress(module, (uint64_t)return_address);
-
-        // jmp call_address
-        tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-        tinyinst_.FixOffsetOrEnqueue(
-            module,
-            (uint32_t)((size_t)call_address - (size_t)(module->min_address)),
-            (uint32_t)(module->instrumented_code_allocated - 4), queue,
-            offset_fixes);
-
-        // done, we don't need to do anything else as return gets redirected
-        // later
-      }
-
-    } else /* CALL, operand_name != XED_OPERAND_RELBR */ {
-      const char *return_address = address + offset;
-
-      TinyDBR::IndirectInstrumentation ii_mode =
-        tinyinst_.ShouldInstrumentIndirect(module,
-                                           inst,
-                                           (size_t)address + last_offset);
-
-      if (ii_mode != TinyDBR::IndirectInstrumentation::II_NONE) {
-        if (tinyinst_.patch_return_addresses) {
-          PushReturnAddress(module, (uint64_t)return_address);
-
-          tinyinst_.InstrumentIndirect(module, inst,
-                                       (size_t)address + last_offset,
-                                       ii_mode,
-                                       (size_t)address);
-
-        } else {
-          //   call label
-          //   jmp return_address
-          //  label:
-          //    <indirect instrumentation>
-
-          tinyinst_.WriteCode(module, CALL, sizeof(CALL));
-          FixDisp4(module, sizeof(JMP));
-
-          size_t translated_return_address = tinyinst_.GetCurrentInstrumentedAddress(module);
-          tinyinst_.OnReturnAddress(module, (size_t)return_address, translated_return_address);
-
-          tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-          tinyinst_.FixOffsetOrEnqueue(
-              module,
-              (uint32_t)((size_t)return_address -
-                         (size_t)(module->min_address)),
-              (uint32_t)(module->instrumented_code_allocated - 4), queue,
-              offset_fixes);
-
-          tinyinst_.InstrumentIndirect(module, inst,
-                                       (size_t)address + last_offset, ii_mode,
-                                       (size_t)address);
-        }
-
-      } else {
-        if (tinyinst_.patch_return_addresses) {
-          PushReturnAddress(module, (uint64_t)return_address);
-          // xed_decoded_inst_t jmp;
-          // CallToJmp(&xedd, &jmp);
-          FixInstructionAndOutput(
-            module,
-            inst,
-            (unsigned char *)(code_ptr + last_offset),
-            (unsigned char *)(address + last_offset), true);
-        } else {
-          FixInstructionAndOutput(
-            module,
-            inst,
-            (unsigned char *)(code_ptr + last_offset),
-            (unsigned char *)(address + last_offset));
-
-          size_t translated_return_address = tinyinst_.GetCurrentInstrumentedAddress(module);
-          tinyinst_.OnReturnAddress(module, (size_t)return_address, translated_return_address);
-
-          tinyinst_.WriteCode(module, JMP, sizeof(JMP));
-
-          tinyinst_.FixOffsetOrEnqueue(
-              module,
-              (uint32_t)((size_t)return_address -
-                         (size_t)(module->min_address)),
-              (uint32_t)(module->instrumented_code_allocated - 4), queue,
-              offset_fixes);
-        }
-      }
-    }
-  }
+#endif  // _DEBUG
 }
 
-void X86Assembler::Init() {
-  xed_tables_init();
+void X86Assembler::HandleBasicBlockEnd(
+	const char*                               address,
+	ModuleInfo*                               module,
+	std::set<char*>*                          queue,
+	std::list<std::pair<uint32_t, uint32_t>>* offset_fixes,
+	Instruction&                              inst,
+	const char*                               code_ptr,
+	size_t                                    offset,
+	size_t                                    last_offset)
+{
+	const auto&                zinst      = inst.zinst;
+	ZydisInstructionCategory   category   = zinst.instruction.meta.category;
+
+	if (category == ZYDIS_CATEGORY_RET)
+	{
+		TinyDBR::IndirectInstrumentation ii_mode =
+			tinyinst_.ShouldInstrumentIndirect(module,
+											   inst,
+											   (size_t)address + last_offset);
+
+		if (ii_mode != TinyDBR::IndirectInstrumentation::II_NONE)
+		{
+			InstrumentRet(module, inst, (size_t)address + last_offset, ii_mode,
+						  (size_t)address);
+		}
+		else
+		{
+			FixInstructionAndOutput(
+				module,
+				inst,
+				(unsigned char*)(code_ptr + last_offset),
+				(unsigned char*)(address + last_offset));
+		}
+	}
+	else if (category == ZYDIS_CATEGORY_COND_BR)
+	{
+		// j* target_address
+		// gets instrumented as:
+		//   j* label
+		//   <edge instrumentation>
+		//   jmp continue_address
+		// label:
+		//   <edge instrumentation>
+		//   jmp target_address
+
+		if (IsIndirectBranch(inst))
+		{
+			FATAL("Error getting branch target");
+		}
+
+		ZyanI64 imm = zinst.instruction.raw.imm[0].value.s;
+
+		const char* target_address1 = address + offset;
+		const char* target_address2 = address + offset + imm;
+
+		if (tinyinst_.GetModule((size_t)target_address2) != module)
+		{
+			WARN("Relative jump to a differen module in bb at %p\n", address);
+			tinyinst_.InvalidInstruction(module);
+			return;
+		}
+
+		// preliminary encode jump instruction
+		// displacement might be changed later as we don't know
+		// the size of edge instrumentation yet
+		// assuming 0 for now
+		int32_t             fixed_disp                                        = sizeof(JMP);
+		ZyanU8              encoded_instruction[ZYDIS_MAX_INSTRUCTION_LENGTH] = { 0 };
+		ZyanUSize           encoded_length                                    = sizeof(encoded_instruction);
+		uint32_t            jump_size                                         = 0;
+		ZydisEncoderRequest req                                               = {};
+		ZyanStatus          zstatus = ZydisEncoderDecodedInstructionToEncoderRequest(
+            &zinst.instruction,
+            zinst.operands,
+            zinst.instruction.operand_count_visible,
+            &req);
+		if (ZYAN_FAILED(zstatus))
+		{
+			FATAL("Error converting request.");
+		}
+
+		req.operands[0].imm.s = fixed_disp;
+		zstatus               = ZydisEncoderEncodeInstruction(&req, encoded_instruction, &encoded_length);
+		if (ZYAN_FAILED(zstatus))
+		{
+			FATAL("Error encoding instruction");
+		}
+
+		jump_size                = encoded_length;
+		size_t jump_start_offset = module->instrumented_code_allocated;
+		tinyinst_.WriteCode(module, encoded_instruction, jump_size);
+		size_t jump_end_offset = module->instrumented_code_allocated;
+
+		// instrument the 1st edge
+		tinyinst_.InstrumentEdge(module, module, (size_t)address,
+								 (size_t)target_address1);
+
+		// jmp target_address1
+		tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+		tinyinst_.FixOffsetOrEnqueue(
+			module,
+			(uint32_t)((size_t)target_address1 - (size_t)(module->min_address)),
+			(uint32_t)(module->instrumented_code_allocated - 4), queue,
+			offset_fixes);
+
+		// time to fix that conditional jump offset
+		if ((module->instrumented_code_allocated - jump_end_offset) != fixed_disp)
+		{
+			fixed_disp =
+				(int32_t)(module->instrumented_code_allocated - jump_end_offset);
+
+			ZyanUSize encoded_length = sizeof(encoded_instruction);
+			req.operands[0].imm.s    = fixed_disp;
+			zstatus                  = ZydisEncoderEncodeInstruction(&req, encoded_instruction, &encoded_length);
+			if (ZYAN_FAILED(zstatus))
+			{
+				FATAL("Error encoding instruction");
+			}
+
+			if (jump_size != encoded_length)
+			{
+				FATAL("Instruction size changed?");
+			}
+			tinyinst_.WriteCodeAtOffset(module, jump_start_offset, encoded_instruction,
+										jump_size);
+		}
+
+		// instrument the 2nd edge
+		tinyinst_.InstrumentEdge(module, module, (size_t)address,
+								 (size_t)target_address2);
+
+		// jmp target_address2
+		tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+		tinyinst_.FixOffsetOrEnqueue(
+			module,
+			(uint32_t)((size_t)target_address2 - (size_t)(module->min_address)),
+			(uint32_t)(module->instrumented_code_allocated - 4),
+			queue,
+			offset_fixes);
+	}
+	else if (category == ZYDIS_CATEGORY_UNCOND_BR)
+	{
+		if (!IsIndirectBranch(inst))
+		{
+			// jmp address
+			// gets instrumented as:
+			// jmp fixed_address
+
+			// must have an operand
+			int32_t     imm            = zinst.operands[0].imm.value.s;
+			const char* target_address = address + offset + imm;
+
+			if (tinyinst_.GetModule((size_t)target_address) != module)
+			{
+				WARN("Relative jump to a differen module in bb at %p\n", address);
+				tinyinst_.InvalidInstruction(module);
+				return;
+			}
+
+			// jmp target_address
+			tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+			tinyinst_.FixOffsetOrEnqueue(
+				module,
+				(uint32_t)((size_t)target_address - (size_t)(module->min_address)),
+				(uint32_t)(module->instrumented_code_allocated - 4), queue,
+				offset_fixes);
+		}
+		else
+		{
+			TinyDBR::IndirectInstrumentation ii_mode =
+				tinyinst_.ShouldInstrumentIndirect(module,
+												   inst,
+												   (size_t)address + last_offset);
+
+			if (ii_mode != TinyDBR::IndirectInstrumentation::II_NONE)
+			{
+				tinyinst_.InstrumentIndirect(module, inst,
+											 (size_t)address + last_offset, ii_mode,
+											 (size_t)address);
+			}
+			else
+			{
+				FixInstructionAndOutput(
+					module,
+					inst,
+					(unsigned char*)(code_ptr + last_offset),
+					(unsigned char*)(address + last_offset));
+			}
+		}
+	}
+	else if (category == ZYDIS_CATEGORY_CALL)
+	{
+		if (!IsIndirectBranch(inst))
+		{
+			// call target_address
+			// gets instrumented as:
+			//   call label
+			//   jmp return_address
+			// label:
+			//   jmp target_address
+
+			// must have an operand
+			int32_t     imm            = zinst.operands[0].imm.value.s;
+			const char* return_address = address + offset;
+			const char* call_address   = address + offset + imm;
+
+			if (tinyinst_.GetModule((size_t)call_address) != module)
+			{
+				WARN("Relative jump to a differen module in bb at %p\n", address);
+				tinyinst_.InvalidInstruction(module);
+				return;
+			}
+
+			// fix the displacement and emit the call
+			if (!tinyinst_.patch_return_addresses)
+			{
+				ZyanU8              encoded_instruction[ZYDIS_MAX_INSTRUCTION_LENGTH] = { 0 };
+				ZyanUSize           encoded_length                                    = sizeof(encoded_instruction);
+				ZydisEncoderRequest req                                               = {};
+				ZyanStatus          zstatus = ZydisEncoderDecodedInstructionToEncoderRequest(
+                    &zinst.instruction,
+                    zinst.operands,
+                    zinst.instruction.operand_count_visible,
+                    &req);
+				if (ZYAN_FAILED(zstatus))
+				{
+					FATAL("Error converting request.");
+				}
+
+				req.operands[0].imm.s = sizeof(JMP);
+				zstatus               = ZydisEncoderEncodeInstruction(&req, encoded_instruction, &encoded_length);
+
+				if (ZYAN_FAILED(zstatus))
+				{
+					FATAL("Error encoding instruction");
+				}
+				tinyinst_.WriteCode(module, encoded_instruction, encoded_length);
+
+				size_t translated_return_address = tinyinst_.GetCurrentInstrumentedAddress(module);
+				tinyinst_.OnReturnAddress(module, (size_t)return_address, translated_return_address);
+
+				// jmp return_address
+				tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+				tinyinst_.FixOffsetOrEnqueue(
+					module,
+					(uint32_t)((size_t)return_address - (size_t)(module->min_address)),
+					(uint32_t)(module->instrumented_code_allocated - 4), queue,
+					offset_fixes);
+
+				// jmp call_address
+				tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+				tinyinst_.FixOffsetOrEnqueue(
+					module,
+					(uint32_t)((size_t)call_address - (size_t)(module->min_address)),
+					(uint32_t)(module->instrumented_code_allocated - 4), queue,
+					offset_fixes);
+			}
+			else
+			{
+				PushReturnAddress(module, (uint64_t)return_address);
+
+				// jmp call_address
+				tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+				tinyinst_.FixOffsetOrEnqueue(
+					module,
+					(uint32_t)((size_t)call_address - (size_t)(module->min_address)),
+					(uint32_t)(module->instrumented_code_allocated - 4), queue,
+					offset_fixes);
+
+				// done, we don't need to do anything else as return gets redirected
+				// later
+			}
+		}
+		else /* CALL, operand_name != XED_OPERAND_RELBR */
+		{
+			const char* return_address = address + offset;
+
+			TinyDBR::IndirectInstrumentation ii_mode =
+				tinyinst_.ShouldInstrumentIndirect(module,
+												   inst,
+												   (size_t)address + last_offset);
+
+			if (ii_mode != TinyDBR::IndirectInstrumentation::II_NONE)
+			{
+				if (tinyinst_.patch_return_addresses)
+				{
+					PushReturnAddress(module, (uint64_t)return_address);
+
+					tinyinst_.InstrumentIndirect(module, inst,
+												 (size_t)address + last_offset,
+												 ii_mode,
+												 (size_t)address);
+				}
+				else
+				{
+					//   call label
+					//   jmp return_address
+					//  label:
+					//    <indirect instrumentation>
+
+					tinyinst_.WriteCode(module, CALL, sizeof(CALL));
+					FixDisp4(module, sizeof(JMP));
+
+					size_t translated_return_address = tinyinst_.GetCurrentInstrumentedAddress(module);
+					tinyinst_.OnReturnAddress(module, (size_t)return_address, translated_return_address);
+
+					tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+					tinyinst_.FixOffsetOrEnqueue(
+						module,
+						(uint32_t)((size_t)return_address -
+								   (size_t)(module->min_address)),
+						(uint32_t)(module->instrumented_code_allocated - 4), queue,
+						offset_fixes);
+
+					tinyinst_.InstrumentIndirect(module, inst,
+												 (size_t)address + last_offset, ii_mode,
+												 (size_t)address);
+				}
+			}
+			else
+			{
+				if (tinyinst_.patch_return_addresses)
+				{
+					PushReturnAddress(module, (uint64_t)return_address);
+					// xed_decoded_inst_t jmp;
+					// CallToJmp(&xedd, &jmp);
+					FixInstructionAndOutput(
+						module,
+						inst,
+						(unsigned char*)(code_ptr + last_offset),
+						(unsigned char*)(address + last_offset), true);
+				}
+				else
+				{
+					FixInstructionAndOutput(
+						module,
+						inst,
+						(unsigned char*)(code_ptr + last_offset),
+						(unsigned char*)(address + last_offset));
+
+					size_t translated_return_address = tinyinst_.GetCurrentInstrumentedAddress(module);
+					tinyinst_.OnReturnAddress(module, (size_t)return_address, translated_return_address);
+
+					tinyinst_.WriteCode(module, JMP, sizeof(JMP));
+
+					tinyinst_.FixOffsetOrEnqueue(
+						module,
+						(uint32_t)((size_t)return_address -
+								   (size_t)(module->min_address)),
+						(uint32_t)(module->instrumented_code_allocated - 4), queue,
+						offset_fixes);
+				}
+			}
+		}
+	}
+}
+
+X86Assembler::~X86Assembler()
+{
+}
+
+void X86Assembler::Init()
+{
+	ZydisMachineMode machine_mode = tinyinst_.child_ptr_size == 8
+										? ZYDIS_MACHINE_MODE_LONG_64
+										: ZYDIS_MACHINE_MODE_LEGACY_32;
+	ZydisStackWidth  stack_width  = tinyinst_.child_ptr_size == 8
+										? ZYDIS_STACK_WIDTH_64
+										: ZYDIS_STACK_WIDTH_32;
+	ZydisDecoderInit(&decoder, machine_mode, stack_width);
+
+#ifdef _DEBUG
+	ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+#endif  // _DEBUG
 }

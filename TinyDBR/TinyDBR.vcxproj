@@ -72,23 +72,23 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\xed\obj\wkit\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(SolutionDir)ThirdParty\xed\obj\wkit\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\zydis\dependencies\zycore\include;$(SolutionDir)ThirdParty\zydis\include;$(SolutionDir)ThirdParty\xbyak;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)ThirdParty\zydis\msvc\bin\$(Configuration)$(Platform);$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\xed\obj\wkit\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(SolutionDir)ThirdParty\xed\obj\wkit\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\zydis\dependencies\zycore\include;$(SolutionDir)ThirdParty\zydis\include;$(SolutionDir)ThirdParty\xbyak;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)ThirdParty\zydis\msvc\bin\$(Configuration)$(Platform);$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <LinkIncremental>true</LinkIncremental>
-    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\xed\obj\wkit\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(SolutionDir)ThirdParty\xed\obj\wkit\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\zydis\dependencies\zycore\include;$(SolutionDir)ThirdParty\zydis\include;$(SolutionDir)ThirdParty\xbyak;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)ThirdParty\zydis\msvc\bin\$(Configuration)$(Platform);$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\xed\obj\wkit\include;$(IncludePath)</IncludePath>
-    <LibraryPath>$(SolutionDir)ThirdParty\xed\obj\wkit\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir);$(SolutionDir)ThirdParty\zydis\dependencies\zycore\include;$(SolutionDir)ThirdParty\zydis\include;$(SolutionDir)ThirdParty\xbyak;$(IncludePath)</IncludePath>
+    <LibraryPath>$(SolutionDir)ThirdParty\zydis\msvc\bin\$(Configuration)$(Platform);$(LibraryPath)</LibraryPath>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -106,7 +106,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
     <Lib>
-      <AdditionalDependencies>xed.lib;xed-ild.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Zycore.lib;Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -129,7 +129,7 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
     <Lib>
-      <AdditionalDependencies>xed.lib;xed-ild.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Zycore.lib;Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -153,7 +153,7 @@
       </Command>
     </PostBuildEvent>
     <Lib>
-      <AdditionalDependencies>xed.lib;xed-ild.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Zycore.lib;Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -177,12 +177,13 @@
       <AdditionalDependencies>xed.lib;xed-ild.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <Lib>
-      <AdditionalDependencies>xed.lib;xed-ild.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>Zycore.lib;Zydis.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="arch\x86\x86_assembler.cpp" />
     <ClCompile Include="arch\x86\x86_helpers.cpp" />
+    <ClCompile Include="arch\x86\x86_memory_monitor.cpp" />
     <ClCompile Include="common.cpp" />
     <ClCompile Include="memory_monitor.cpp" />
     <ClCompile Include="tinydbr.cpp" />
@@ -195,11 +196,11 @@
     <ClInclude Include="arch\x86\reg.h" />
     <ClInclude Include="arch\x86\x86_assembler.h" />
     <ClInclude Include="arch\x86\x86_helpers.h" />
+    <ClInclude Include="arch\x86\x86_memory_monitor.h" />
     <ClInclude Include="assembler.h" />
     <ClInclude Include="common.h" />
     <ClInclude Include="instruction.h" />
     <ClInclude Include="memory_monitor.h" />
-    <ClInclude Include="singleton.h" />
     <ClInclude Include="tinydbr.h" />
     <ClInclude Include="unwind.h" />
     <ClInclude Include="windows\api_helper.h" />

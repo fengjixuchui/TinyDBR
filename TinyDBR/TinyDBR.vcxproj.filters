@@ -39,6 +39,9 @@
     <ClCompile Include="windows\api_helper.cpp">
       <Filter>Source Files\windows</Filter>
     </ClCompile>
+    <ClCompile Include="arch\x86\x86_memory_monitor.cpp">
+      <Filter>Source Files\arch\x86</Filter>
+    </ClCompile>
     <ClCompile Include="memory_monitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -62,9 +65,6 @@
     <ClInclude Include="unwind.h">
       <Filter>Source Files</Filter>
     </ClInclude>
-    <ClInclude Include="singleton.h">
-      <Filter>Source Files</Filter>
-    </ClInclude>
     <ClInclude Include="tinydbr.h">
       <Filter>Source Files</Filter>
     </ClInclude>
@@ -85,6 +85,9 @@
     </ClInclude>
     <ClInclude Include="memory_monitor.h">
       <Filter>Source Files</Filter>
+    </ClInclude>
+    <ClInclude Include="arch\x86\x86_memory_monitor.h">
+      <Filter>Source Files\arch\x86</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
