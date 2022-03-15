@@ -17,22 +17,173 @@ limitations under the License.
 #include "common.h"
 #include "x86_helpers.h"
 
-ZydisRegister GetUnusedRegister(ZydisRegister used_register, int operand_width)
+#include <intrin.h>
+#include <set>
+
+
+bool GetFreeRegister(
+	const ZydisDecodedInstruction& inst,
+	const ZydisDecodedOperand*     operands,
+	size_t                         count,
+	std::vector<ZydisRegister>&    reg_list)
 {
-	switch (operand_width)
+	// these are all nonvolatile registers
+	// which means we don't need to protect 
+	// them before a call instruction
+	std::set<ZydisRegister> available_registers = 
 	{
-	case 16:
-		if (used_register == ZYDIS_REGISTER_AX) return ZYDIS_REGISTER_CX;
-		return ZYDIS_REGISTER_AX;
-	case 32:
-		if (used_register == ZYDIS_REGISTER_EAX) return ZYDIS_REGISTER_ECX;
-		return ZYDIS_REGISTER_EAX;
-	case 64:
-		if (used_register == ZYDIS_REGISTER_RAX) return ZYDIS_REGISTER_RCX;
-		return ZYDIS_REGISTER_RAX;
-	default:
-		FATAL("Unexpected operand width");
+		ZYDIS_REGISTER_R12,
+		ZYDIS_REGISTER_R13,
+		ZYDIS_REGISTER_R14,
+		ZYDIS_REGISTER_R15
+	};
+
+	if (count > available_registers.size())
+	{
+		return false;
 	}
+
+	// including the hidden operands
+	for (size_t i = 0; i != inst.operand_count; ++i)
+	{
+		const auto& operand = operands[i];
+		switch (operand.type)
+		{
+		case ZYDIS_OPERAND_TYPE_REGISTER:
+		{
+			if (IsGeneralPurposeRegister(operand.reg.value))
+			{
+				available_registers.erase(GetFullSizeRegister(operand.reg.value));
+			}
+		}
+		break;
+		case ZYDIS_OPERAND_TYPE_MEMORY:
+		{
+			if (IsGeneralPurposeRegister(operand.mem.base))
+			{
+				available_registers.erase(GetFullSizeRegister(operand.mem.base));
+			}
+			if (IsGeneralPurposeRegister(operand.mem.index))
+			{
+				available_registers.erase(GetFullSizeRegister(operand.mem.index));
+			}
+		}
+		break;
+		case ZYDIS_OPERAND_TYPE_POINTER:
+			FATAL("what's this?");
+			break;
+		case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (available_registers.empty())
+	{
+		// unlikely
+		FATAL("no free register found.");
+	}
+
+	reg_list.clear();
+	for (size_t i = 0; i != count; ++i)
+	{
+		if (available_registers.empty())
+		{
+			break;
+		}
+
+		auto reg = *available_registers.cbegin();
+		reg_list.push_back(reg);
+		available_registers.erase(reg);
+	}
+
+	return reg_list.size() == count;
+}
+
+
+ZydisRegister GetFreeRegister(
+	const ZydisDecodedInstruction& inst,
+	const ZydisDecodedOperand*     operands)
+{
+	std::vector<ZydisRegister> reg_list;
+	if (!GetFreeRegister(inst, operands, 1, reg_list))
+	{
+		FATAL("get free register failed.");
+	}
+	return reg_list[0];
+}
+
+std::pair<ZydisRegister, ZydisRegister> 
+GetFreeRegister2(
+	const ZydisDecodedInstruction& inst, const ZydisDecodedOperand* operands)
+{
+	std::vector<ZydisRegister> reg_list;
+	if (!GetFreeRegister(inst, operands, 2, reg_list))
+	{
+		FATAL("get free register failed.");
+	}
+	return std::make_pair(reg_list[0], reg_list[1]);
+}
+
+ZydisRegister GetFreeRegisterSSE(
+	const ZydisDecodedInstruction& inst, const ZydisDecodedOperand* operands)
+{
+	std::set<ZydisRegister> available_registers = {
+		ZYDIS_REGISTER_XMM0,
+		ZYDIS_REGISTER_XMM1,
+		ZYDIS_REGISTER_XMM2,
+		ZYDIS_REGISTER_XMM3,
+		ZYDIS_REGISTER_XMM4,
+		ZYDIS_REGISTER_XMM5,
+		ZYDIS_REGISTER_XMM6,
+		ZYDIS_REGISTER_XMM7,
+		ZYDIS_REGISTER_XMM8,
+	};
+
+	// including the hidden operands
+	for (size_t i = 0; i != inst.operand_count; ++i)
+	{
+		const auto& operand = operands[i];
+		switch (operand.type)
+		{
+		case ZYDIS_OPERAND_TYPE_REGISTER:
+		{
+			if (IsVectorRegister(operand.reg.value))
+			{
+				available_registers.erase(GetReducedVectorRegister(operand.reg.value));
+			}
+		}
+		break;
+		case ZYDIS_OPERAND_TYPE_MEMORY:
+		{
+			if (IsVectorRegister(operand.mem.base))
+			{
+				available_registers.erase(GetReducedVectorRegister(operand.mem.base));
+			}
+			if (IsVectorRegister(operand.mem.index))
+			{
+				available_registers.erase(GetReducedVectorRegister(operand.mem.index));
+			}
+		}
+		break;
+		case ZYDIS_OPERAND_TYPE_POINTER:
+			FATAL("what's this?");
+			break;
+		case ZYDIS_OPERAND_TYPE_IMMEDIATE:
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (available_registers.empty())
+	{
+		// unlikely
+		FATAL("no free register found.");
+	}
+
+	return *available_registers.cbegin();
 }
 
 ZyanU32 GetRegisterWidth(ZydisRegister reg)
@@ -69,10 +220,95 @@ ZydisRegister GetFullSizeRegister(ZydisRegister reg, int child_ptr_size)
 	return GetNBitRegister(reg, child_ptr_size * 8);
 }
 
+ZydisRegister GetReducedVectorRegister(ZydisRegister reg)
+{
+	if (reg >= ZYDIS_REGISTER_ZMM0 && reg <= ZYDIS_REGISTER_ZMM31)
+	{
+		return static_cast<ZydisRegister>(static_cast<int>(reg) - 64);
+	}
+	else if (reg >= ZYDIS_REGISTER_YMM0 && reg <= ZYDIS_REGISTER_YMM31)
+	{
+		return static_cast<ZydisRegister>(static_cast<int>(reg) - 32);
+	}
+	else if (reg >= ZYDIS_REGISTER_XMM0 && reg <= ZYDIS_REGISTER_XMM31)
+	{
+		return reg;
+	}
+	else
+	{
+		FATAL("Error register value.");
+	}
+}
+
+void DetectAvxSupport(bool& support_avx, bool& support_avx512)
+{
+	static bool first_run = true;
+	static bool avx       = false;
+	static bool avx512    = false;
+
+	if (first_run)
+	{
+		int info[4] = { 0 };
+		__cpuid(info, 0);
+		int nIds = info[0];
+
+		if (nIds >= 0x00000001)
+		{
+			__cpuid(info, 0x00000001);
+			avx = (info[2] & ((int)1 << 28)) != 0;
+		}
+
+		if (nIds >= 0x00000007)
+		{
+			__cpuid(info, 0x00000007);
+			avx512 = (info[1] & ((int)1 << 16)) != 0;
+		}
+
+		first_run = false;
+	}
+
+	support_avx = avx;
+	support_avx512 = avx512;
+}
+
+ZydisRegister GetFullSizeVectorRegister(ZydisRegister reg, bool hw_support)
+{
+	if (hw_support)
+	{
+		bool support_avx    = false;
+		bool support_avx512 = false;
+		DetectAvxSupport(support_avx, support_avx512);
+
+		static_assert(ZYDIS_REGISTER_ZMM0 - ZYDIS_REGISTER_XMM0 == 64, "register enum changed.");
+
+		// avx512 support zmm
+		if (support_avx512)
+		{
+			return GetNBitVectorRegister(reg, 512);
+		}
+
+		// avx support ymm
+		if (support_avx)
+		{
+			return GetNBitVectorRegister(reg, 256);
+		}
+
+		return reg;
+	}
+	else
+	{
+		// return the maxval length of the register
+		return GetNBitVectorRegister(reg, 512);
+	}
+}
+
+
 ZydisRegister GetLow8BitRegister(ZydisRegister reg)
 {
 	switch (reg)
 	{
+	case ZYDIS_REGISTER_NONE:
+		return ZYDIS_REGISTER_NONE;
 	case ZYDIS_REGISTER_AL:
 	case ZYDIS_REGISTER_AH:
 	case ZYDIS_REGISTER_AX:
@@ -101,61 +337,73 @@ ZydisRegister GetLow8BitRegister(ZydisRegister reg)
 	case ZYDIS_REGISTER_RBX:
 		return ZYDIS_REGISTER_BL;
 
+	case ZYDIS_REGISTER_SPL:
 	case ZYDIS_REGISTER_SP:
 	case ZYDIS_REGISTER_ESP:
 	case ZYDIS_REGISTER_RSP:
 		return ZYDIS_REGISTER_SPL;
 
+	case ZYDIS_REGISTER_BPL:
 	case ZYDIS_REGISTER_BP:
 	case ZYDIS_REGISTER_EBP:
 	case ZYDIS_REGISTER_RBP:
 		return ZYDIS_REGISTER_BPL;
 
+	case ZYDIS_REGISTER_SIL:
 	case ZYDIS_REGISTER_SI:
 	case ZYDIS_REGISTER_ESI:
 	case ZYDIS_REGISTER_RSI:
 		return ZYDIS_REGISTER_SIL;
 
+	case ZYDIS_REGISTER_DIL:
 	case ZYDIS_REGISTER_DI:
 	case ZYDIS_REGISTER_EDI:
 	case ZYDIS_REGISTER_RDI:
 		return ZYDIS_REGISTER_DIL;
 
+	case ZYDIS_REGISTER_R8B:
 	case ZYDIS_REGISTER_R8W:
 	case ZYDIS_REGISTER_R8D:
 	case ZYDIS_REGISTER_R8:
 		return ZYDIS_REGISTER_R8B;
 
+	case ZYDIS_REGISTER_R9B:
 	case ZYDIS_REGISTER_R9W:
 	case ZYDIS_REGISTER_R9D:
 	case ZYDIS_REGISTER_R9:
 		return ZYDIS_REGISTER_R9B;
 
+	case ZYDIS_REGISTER_R10B:
 	case ZYDIS_REGISTER_R10W:
 	case ZYDIS_REGISTER_R10D:
 	case ZYDIS_REGISTER_R10:
 		return ZYDIS_REGISTER_R10B;
 
+	case ZYDIS_REGISTER_R11B:
 	case ZYDIS_REGISTER_R11W:
 	case ZYDIS_REGISTER_R11D:
 	case ZYDIS_REGISTER_R11:
 		return ZYDIS_REGISTER_R11B;
 
+	case ZYDIS_REGISTER_R12B:
 	case ZYDIS_REGISTER_R12W:
 	case ZYDIS_REGISTER_R12D:
 	case ZYDIS_REGISTER_R12:
 		return ZYDIS_REGISTER_R12B;
 
+	case ZYDIS_REGISTER_R13B:
 	case ZYDIS_REGISTER_R13W:
 	case ZYDIS_REGISTER_R13D:
 	case ZYDIS_REGISTER_R13:
 		return ZYDIS_REGISTER_R13B;
 
+	case ZYDIS_REGISTER_R14B:
 	case ZYDIS_REGISTER_R14W:
 	case ZYDIS_REGISTER_R14D:
 	case ZYDIS_REGISTER_R14:
 		return ZYDIS_REGISTER_R14B;
 
+	case ZYDIS_REGISTER_R15B:
 	case ZYDIS_REGISTER_R15W:
 	case ZYDIS_REGISTER_R15D:
 	case ZYDIS_REGISTER_R15:
@@ -171,7 +419,7 @@ ZydisRegister GetNBitRegister(ZydisRegister reg, size_t nbits)
 {
 	ZydisRegister xl = GetLow8BitRegister(reg);
 
-	if (nbits == 8)
+	if (xl == ZYDIS_REGISTER_NONE || nbits == 8)
 	{
 		return xl;
 	}
@@ -202,9 +450,83 @@ ZydisRegister GetNBitRegister(ZydisRegister reg, size_t nbits)
 	return result;
 }
 
+ZydisRegister GetNBitVectorRegister(ZydisRegister reg, size_t nbits)
+{
+	ZydisRegister result  = {};
+	auto          xmm_reg = GetReducedVectorRegister(reg);
+	if (nbits == 128)
+	{
+		result = xmm_reg;
+	}
+	else if (nbits == 256)
+	{
+		result = static_cast<ZydisRegister>(static_cast<uint32_t>(xmm_reg) + 32);
+	}
+	else if (nbits == 512)
+	{
+		result = static_cast<ZydisRegister>(static_cast<uint32_t>(xmm_reg) + 64);
+	}
+	else
+	{
+		FATAL("Error register bits:%d", (int)nbits);
+	}
+	return result;
+}
+
+size_t GetMMRegisterSize(ZydisRegister reg)
+{
+	if (reg >= ZYDIS_REGISTER_ZMM0 && reg <= ZYDIS_REGISTER_ZMM31)
+	{
+		return 64;
+	}
+	else if (reg >= ZYDIS_REGISTER_YMM0 && reg <= ZYDIS_REGISTER_YMM31)
+	{
+		return 32;
+	}
+	else if (reg >= ZYDIS_REGISTER_XMM0 && reg <= ZYDIS_REGISTER_XMM31)
+	{
+		return 16;
+	}
+	else
+	{
+		FATAL("Error register value.");
+	}
+}
+
 bool IsGeneralPurposeRegister(ZydisRegister reg)
 {
 	return (reg >= ZYDIS_REGISTER_AL) && (reg <= ZYDIS_REGISTER_R15);
+}
+
+bool IsVectorRegister(ZydisRegister reg)
+{
+	return (reg >= ZYDIS_REGISTER_XMM0) && (reg <= ZYDIS_REGISTER_ZMM31);
+}
+
+bool Is64BitGPRRegister(ZydisRegister reg)
+{
+	return (reg >= ZYDIS_REGISTER_RAX) && (reg <= ZYDIS_REGISTER_R15);
+}
+
+bool IsHigh8BitRegister(ZydisRegister reg)
+{
+	return (reg >= ZYDIS_REGISTER_AH) && (reg <= ZYDIS_REGISTER_BH);
+}
+
+
+
+bool IsSetCCInstruction(ZydisMnemonic mnemonic)
+{
+	return (mnemonic >= ZYDIS_MNEMONIC_SETB) &&
+		   (mnemonic <= ZYDIS_MNEMONIC_SETZ) &&
+		   (mnemonic != ZYDIS_MNEMONIC_SETSSBSY);
+}
+
+
+
+const Xbyak::Operand& ZydisRegToXbyakReg(ZydisRegister reg)
+{
+	return ZydisRegToXbyakReg<Xbyak::Operand>(reg);
 }
 
 uint32_t Pushaq(ZydisMachineMode mmode, unsigned char* encoded, size_t encoded_size)
@@ -320,10 +642,12 @@ uint32_t MovRegAVX(ZydisMachineMode mmode, ZydisRegister dst, const ZydisDecoded
 	return encoded_size;
 }
 
-uint32_t MovStackAVX(ZydisMachineMode mmode, size_t stack_offset, const ZydisDecodedOperand& src,
+uint32_t MovStackAVX(
+	ZydisMachineMode mmode, size_t stack_offset,
+	ZydisRegister src, bool is_save, 
 	unsigned char* encoded, size_t encoded_size)
 {
-	uint32_t      byte_size = src.size / 8;
+	uint32_t      byte_size = GetMMRegisterSize(src);
 	ZydisMnemonic mnemonic  = ZYDIS_MNEMONIC_INVALID;
 	// use aligned load to force memory align thus improve performance
 	switch (byte_size)
@@ -345,13 +669,28 @@ uint32_t MovStackAVX(ZydisMachineMode mmode, size_t stack_offset, const ZydisDec
 	req.machine_mode                 = mmode;
 	req.mnemonic                     = mnemonic;
 	req.operand_count                = 2;
-	req.operands[0].type             = ZYDIS_OPERAND_TYPE_MEMORY;
-	req.operands[0].mem.size         = src.size / 8;
-	req.operands[0].mem.base         = ZYDIS_REGISTER_RSP;
-	req.operands[0].mem.displacement = stack_offset;
 
-	req.operands[1].type      = src.type;
-	req.operands[1].reg.value = src.reg.value;
+	size_t mem_idx = 0;
+	size_t reg_idx = 0;
+	if (is_save)
+	{
+		mem_idx = 0;
+		reg_idx = 1;
+	}
+	else
+	{
+		mem_idx = 1;
+		reg_idx = 0;
+	}
+
+	req.operands[mem_idx].type       = ZYDIS_OPERAND_TYPE_MEMORY;
+	req.operands[mem_idx].mem.size   = byte_size;
+	req.operands[mem_idx].mem.base   = ZYDIS_REGISTER_RSP;
+	req.operands[mem_idx].mem.displacement = stack_offset;
+
+	req.operands[reg_idx].type = ZYDIS_OPERAND_TYPE_REGISTER;
+	req.operands[reg_idx].reg.value = src;
+
 
 	if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&req, encoded, &encoded_size)))
 	{
@@ -412,7 +751,8 @@ size_t GetExplicitMemoryOperandCount(const ZydisDecodedOperand* operands, size_t
 	return mem_operand_count;
 }
 
-const ZydisDecodedOperand* GetExplicitMemoryOperand(const ZydisDecodedOperand* operands, size_t count)
+const ZydisDecodedOperand* GetExplicitMemoryOperand(
+	const ZydisDecodedOperand* operands, size_t count, size_t* index)
 {
 	const ZydisDecodedOperand* mem_operand = nullptr;
 	for (size_t i = 0; i != count; ++i)
@@ -429,6 +769,10 @@ const ZydisDecodedOperand* GetExplicitMemoryOperand(const ZydisDecodedOperand* o
 		}
 
 		mem_operand = &operand;
+		if (index)
+		{
+			*index = i;
+		}
 		break;
 	}
 	return mem_operand;
